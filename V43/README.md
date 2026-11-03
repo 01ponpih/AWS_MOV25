@@ -3,6 +3,8 @@
 **Namn:** Pontus Pihlström
 **Kurs:** AWS
 **Datum:** 2026-10-27
+
+**GitHub-repo:** https://github.com/01ponpih/AWS_MOV25
 ## Delmoment 1: Repo
 Skapat mappen `V43` i kursrepot.
 
@@ -89,7 +91,7 @@ Loggade in som `dev-erik` i ett privat fönster och gick direkt till bucketens U
 
 ---
 
-## VG: Flera samverkande roller i en kedja
+## VG:
 För att uppnå VG-kravet har jag designat en rollkedja med två separata IAM-roller för att uppnå strikt least privilege mellan tjänsterna. Allt är automatiserat via `roller.sh`.
 
 ### Design av kedjan
