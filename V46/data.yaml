@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Novatrix v46 - Datastack (RDS MariaDB med lösenord i Secrets Manager, krypterat EFS med mount targets).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: novatrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.t4g.micro, db.t4g.small]
+  DbEngineVersion:
+    Type: String
+    Default: "11.8"
+    Description: Huvudversion av MariaDB. RDS väljer en aktuell patchversion.
+  DbName:
+    Type: String
+    Default: wordpress
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]{0,62}$'
+  DbUsername:
+    Type: String
+    Default: dbadmin
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,15}$'
+  BackupRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 35
+    Description: Free plan tillåter högst 1 dag. I drift hade 7 dagar valts.
+
+Resources:
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'Master credentials for ${Prefix} RDS'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DbUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-db-secret'
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-PrivateSubnetAId'
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-PrivateSubnetBId'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-db-subnets'
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mariadb
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp2
+      StorageEncrypted: true
+      DBName: !Ref DbName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-DbSgId'
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-db'
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbInstance
+      TargetType: AWS::RDS::DBInstance
+
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${Prefix}-efs'
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowMount
+            Effect: Allow
+            Principal: { AWS: "*" }
+            Action: 
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+              - elasticfilesystem:ClientRootAccess
+            Resource: "*"
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: { AWS: "*" }
+            Action: "*"
+            Resource: "*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId:
+        Fn::ImportValue: !Sub '${Prefix}-natverk-PrivateSubnetAId'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-EfsSgId'
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId:
+        Fn::ImportValue: !Sub '${Prefix}-natverk-PrivateSubnetBId'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-EfsSgId'
+
+Outputs:
+  EfsId:
+    Value: !Ref FileSystem
+    Export: { Name: !Sub '${Prefix}-data-EfsId' }
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+    Export: { Name: !Sub '${Prefix}-data-DbEndpoint' }
+  DbName:
+    Value: !Ref DbName
+    Export: { Name: !Sub '${Prefix}-data-DbName' }
+  DbSecretArn:
+    Value: !Ref DbSecret
+    Export: { Name: !Sub '${Prefix}-data-DbSecretArn' }

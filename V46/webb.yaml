@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Novatrix v46 - Webbstack (EC2 med WordPress, IAM-roll, Secrets Manager för WP-admin).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: novatrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  DataBucket:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+  BackupBucket:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  WpTitle:
+    Type: String
+    Default: Novatrix AB
+    AllowedPattern: '^[A-Za-z0-9 ]{1,40}$'
+  WpAdminUser:
+    Type: String
+    Default: novatrix_admin
+    AllowedPattern: '^[a-z][a-z0-9_]{2,30}$'
+  WpAdminEmail:
+    Type: String
+    Default: admin@novatrix.example
+
+Resources:
+  WpAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'WordPress admin password for ${Prefix}'
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-wp-admin-secret'
+
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: s3-data-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: s3:ListBucket, Resource: !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}' }
+              - { Effect: Allow, Action: s3:GetObject, Resource: !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/*' }
+        - PolicyName: s3-backup-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: [s3:PutObject, s3:AbortMultipartUpload], Resource: !Sub 'arn:${AWS::Partition}:s3:::${BackupBucket}/backup/*' }
+        - PolicyName: read-own-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - Fn::ImportValue: !Sub '${Prefix}-data-DbSecretArn'
+                  - !Ref WpAdminSecret
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-web-role'
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WebRole]
+
+  WebInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT20M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref WebInstanceProfile
+      SubnetId:
+        Fn::ImportValue: !Sub '${Prefix}-natverk-PublicSubnetId'
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-WebSgId'
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeType: gp3, VolumeSize: 8, Encrypted: true, DeleteOnTermination: true }
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-web'
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -eEuo pipefail
+            export AWS_DEFAULT_REGION=${AWS::Region}
+            WP_DIR=/var/www/html
+
+            dnf install -y aws-cfn-bootstrap
+            signal() { /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} --resource WebInstance --region ${AWS::Region} || true; }
+            trap 'rc=$?; if [ $rc -ne 0 ]; then signal 1; fi' EXIT
+
+            dnf install -y httpd php php-fpm php-mysqlnd php-gd php-xml php-mbstring \
+              php-intl php-opcache php-cli php-zip mariadb105 amazon-efs-utils jq cronie
+
+            DB_JSON=""
+            for i in 1 2 3 4 5 6; do
+              DB_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecretArn} --query SecretString --output text) && break
+              sleep 10
+            done
+            DB_USER=$(echo "$DB_JSON" | jq -r .username)
+            DB_PASSWORD=$(echo "$DB_JSON" | jq -r .password)
+            
+            if [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" = "null" ]; then
+              echo "FEL: kunde inte läsa databasuppgifterna" >&2; exit 1
+            fi
+
+            WP_ADMIN_PASSWORD=$(aws secretsmanager get-secret-value --secret-id ${WpSecretArn} --query SecretString --output text)
+
+            mkdir -p $WP_DIR/wp-content
+            grep -q ${EfsId} /etc/fstab || echo "${EfsId}:/ $WP_DIR/wp-content efs _netdev,noresvport,tls 0 0" >> /etc/fstab
+            for i in 1 2 3 4 5 6; do
+              timeout 90 mount -t efs -o tls ${EfsId}:/ $WP_DIR/wp-content && break
+              sleep 15
+            done
+            mountpoint -q $WP_DIR/wp-content
+
+            for i in 1 2 3 4 5 6; do
+              MYSQL_PWD="$DB_PASSWORD" mysql --ssl -h ${DbEndpoint} -u "$DB_USER" ${DbName} -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 10
+            done
+            MYSQL_PWD="$DB_PASSWORD" mysql --ssl -h ${DbEndpoint} -u "$DB_USER" ${DbName} -e 'SELECT 1' >/dev/null
+
+            cd /tmp
+            curl -fsSL -o wordpress.tar.gz https://wordpress.org/latest.tar.gz
+            tar -xzf wordpress.tar.gz
+            cp -a /tmp/wordpress/. $WP_DIR/
+            rm -rf /tmp/wordpress /tmp/wordpress.tar.gz
+            
+            curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            chmod +x /usr/local/bin/wp
+            WP="/usr/local/bin/wp --allow-root --path=$WP_DIR"
+
+            $WP config create --dbname=${DbName} --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" \
+              --dbhost=${DbEndpoint} --dbcharset=utf8mb4 --skip-check
+            $WP config set DISALLOW_FILE_EDIT true --raw --type=constant
+            $WP config set MYSQL_CLIENT_FLAGS MYSQLI_CLIENT_SSL --raw --type=constant
+
+            TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            SITE_HOST=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-hostname || true)
+            [ -n "$SITE_HOST" ] || SITE_HOST=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+            $WP core install --url="http://$SITE_HOST" --title="${WpTitle}" \
+              --admin_user="${WpAdminUser}" --admin_password="$WP_ADMIN_PASSWORD" \
+              --admin_email="${WpAdminEmail}" --skip-email
+
+            cat > /etc/httpd/conf.d/novatrix.conf <<'CONF'
+            ServerTokens Prod
+            ServerSignature Off
+            <Directory /var/www/html>
+                Options -Indexes +FollowSymLinks
+                AllowOverride All
+            </Directory>
+            CONF
+
+            chown -R apache:apache $WP_DIR
+            find $WP_DIR -type d -exec chmod 755 {} +
+            find $WP_DIR -type f -exec chmod 644 {} +
+            chown root:apache $WP_DIR/wp-config.php
+            chmod 640 $WP_DIR/wp-config.php
+
+            cat > /usr/local/bin/novatrix-backup.sh <<'BKP'
+            #!/bin/bash
+            set -euo pipefail
+            export AWS_DEFAULT_REGION=${AWS::Region}
+            DB_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecretArn} --query SecretString --output text)
+            DB_USER=$(echo "$DB_JSON" | jq -r .username)
+            DB_PASSWORD=$(echo "$DB_JSON" | jq -r .password)
+            TS=$(date +%Y%m%d-%H%M%S)
+            FILE=/tmp/${DbName}-$TS.sql.gz
+            trap 'rm -f "$FILE"' EXIT
+            MYSQL_PWD="$DB_PASSWORD" mysqldump --ssl --host=${DbEndpoint} --user="$DB_USER" \
+              --single-transaction --quick --no-tablespaces ${DbName} | gzip -9 > "$FILE"
+            aws s3 cp "$FILE" "s3://${BackupBucket}/backup/${DbName}-$TS.sql.gz" --only-show-errors
+            BKP
+
+            chmod 750 /usr/local/bin/novatrix-backup.sh
+            echo '0 2 * * * root /usr/local/bin/novatrix-backup.sh >> /var/log/novatrix-backup.log 2>&1' > /etc/cron.d/novatrix-backup
+
+            systemctl enable --now php-fpm httpd crond
+            /usr/local/bin/novatrix-backup.sh || true
+
+            trap - EXIT
+            signal 0
+          - EfsId: !ImportValue {"Fn::Sub": "${Prefix}-data-EfsId"}
+            DbEndpoint: !ImportValue {"Fn::Sub": "${Prefix}-data-DbEndpoint"}
+            DbName: !ImportValue {"Fn::Sub": "${Prefix}-data-DbName"}
+            DbSecretArn: !ImportValue {"Fn::Sub": "${Prefix}-data-DbSecretArn"}
+            WpSecretArn: !Ref WpAdminSecret
+
+Outputs:
+  WebsiteUrl:
+    Value: !Sub 'http://${WebInstance.PublicDnsName}/'
+  AdminUrl:
+    Value: !Sub 'http://${WebInstance.PublicDnsName}/wp-admin'
+  WpAdminSecretArn:
+    Description: Hämta lösenordet med aws secretsmanager get-secret-value
+    Value: !Ref WpAdminSecret
