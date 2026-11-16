@@ -43,8 +43,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${Prefix}-db-secret'
-        - Key: Course
-          Value: MOV25 
 
   DbSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -81,6 +79,8 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${Prefix}-db'
+        - Key: Course
+          Value: MOV25 
 
   DbSecretAttachment:
     Type: AWS::SecretsManager::SecretTargetAttachment
