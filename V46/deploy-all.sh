@@ -17,12 +17,6 @@ if [ -z "${MY_IP:-}" ]; then
 fi
 [[ "$MY_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || { echo "FEL: ogiltig MY_IP: $MY_IP"; exit 1; }
 
-if [[ "$MY_IP" == "3.248."* ]] || [[ "$MY_IP" == "3.249."* ]] || [[ "$MY_IP" == "3.250."* ]] || [[ "$MY_IP" == "3.251."* ]] || [[ "$MY_IP" == "3.252."* ]] || [[ "$MY_IP" == "3.253."* ]] || [[ "$MY_IP" == "3.254."* ]] || [[ "$MY_IP" == "3.255."* ]]; then
-  echo "VARNING: Din IP ($MY_IP) ser ut att vara en AWS CloudShell-IP. Om du vill SSH:a in från din egen dator, kör skriptet med MY_IP=<din-ip>/32"
-  echo "Pausar i 5 sekunder..."
-  sleep 5
-fi
-
 echo "== Förkontroller"
 aws ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null \
   || { echo "FEL: key pair '$KEY_NAME' saknas i $AWS_DEFAULT_REGION"; exit 1; }
@@ -67,6 +61,7 @@ aws cloudformation deploy --stack-name "$PREFIX-data" \
   --no-fail-on-empty-changeset --tags $TAGS
 
 echo "== 3/3 Stack $PREFIX-webb"
+# Vid felsökning kan man köra DISABLE_ROLLBACK=1 bash deploy-all.sh
 ROLLBACK_FLAG=()
 [ "${DISABLE_ROLLBACK:-0}" = "1" ] && ROLLBACK_FLAG=(--disable-rollback)
 
