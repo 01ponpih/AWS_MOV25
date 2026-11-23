@@ -1,0 +1,39 @@
+[15:56:10] Sajt: http://novatrix-alb-316472916.eu-north-1.elb.amazonaws.com/   Grupp: novatrix-web-asg   Desired: 2   Healthy nu: 2
+[15:56:10] Servrar före testet:
+----------------------------------------------------------------
+|                   DescribeAutoScalingGroups                  |
++----------------------+--------------+------------+-----------+
+|  i-09acb83ab5c9c0b59 |  eu-north-1a |  InService |  Healthy  |
+|  i-0dda8a757afc9c08a |  eu-north-1b |  InService |  Healthy  |
++----------------------+--------------+------------+-----------+
+[15:56:17] Avslutar server i-09acb83ab5c9c0b59 (zon eu-north-1a). curl-loopen mäter sajten under tiden.
+[15:56:18] healthy=1/2  (förfluten tid: 1 s)
+[15:56:33] healthy=1/2  (förfluten tid: 16 s)
+[15:56:49] healthy=1/2  (förfluten tid: 32 s)
+[15:57:05] healthy=1/2  (förfluten tid: 48 s)
+[15:57:20] healthy=1/2  (förfluten tid: 63 s)
+[15:57:36] healthy=1/2  (förfluten tid: 79 s)
+[15:57:52] healthy=2/2  (förfluten tid: 95 s)
+[15:58:02] Återhämtad: 2 servrar är healthy igen efter 105 s, utan manuell handpåläggning.
+[15:58:02] Servrar efter testet (ersättaren kan ligga i någon av zonerna):
+----------------------------------------------------------------
+|                   DescribeAutoScalingGroups                  |
++----------------------+--------------+------------+-----------+
+|  i-043e0f4d52c0f2eed |  eu-north-1a |  InService |  Healthy  |
+|  i-0dda8a757afc9c08a |  eu-north-1b |  InService |  Healthy  |
++----------------------+--------------+------------+-----------+
+[15:58:02] Svarskoder från curl-loopen under hela testet (antal per kod):
+     88 200
+[15:58:02] Anrop som inte gav 200: 0 av 88
+[15:58:03] Skalningshändelser:
+---------------------------------------------------------------------------------------------------------
+|                                       DescribeScalingActivities                                       |
++-----------------------------------+-------------+-----------------------------------------------------+
+|  2026-11-23T14:56:17.023000+00:00 |  Successful |  Launching a new EC2 instance: i-043e0f4d52c0f2eed  |
+|  2026-11-23T14:56:11.562000+00:00 |  Successful |  Terminating EC2 instance: i-09acb83ab5c9c0b59      |
+|  2026-11-23T14:25:53.895000+00:00 |  Successful |  Terminating EC2 instance: i-09eb39d7a87abbf0b      |
+|  2026-11-23T14:20:11.890000+00:00 |  Successful |  Terminating EC2 instance: i-0fa9b84171b7bc97c      |
+|  2026-11-23T14:08:21.224000+00:00 |  Successful |  Launching a new EC2 instance: i-09acb83ab5c9c0b59  |
+|  2026-11-23T14:08:08.886000+00:00 |  Successful |  Terminating EC2 instance: i-07b150178bde84c2c      |
++-----------------------------------+-------------+-----------------------------------------------------+
+[15:58:03] Utskriften är sparad i failover-20261123-155607.txt

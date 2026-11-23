@@ -1,0 +1,462 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Novatrix v47 - Skalningsstack: Application Load Balancer, target group, listener, launch template
+  (WordPress installerar sig själv via user data) och Auto Scaling-grupp över två zoner med target tracking.
+  Importerar från novatrix-natverk, novatrix-data och novatrix-webb.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: novatrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Key pair för SSH vid felsökning.
+  BackupBucket:
+    Type: String
+    Description: Befintlig backup-bucket (servrarna skriver databasdumpar till backup/).
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Golv. Min 2 ger en server i varje zon.
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Tak. Sätter övre gräns för kostnaden.
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  TargetCpuUtilization:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 90
+    Description: Målvärde för genomsnittlig CPU (target tracking).
+  HealthCheckGracePeriod:
+    Type: Number
+    Default: 600
+    Description: >-
+      Sekunder innan Auto Scaling-gruppen börjar agera på ohälsa. ALB:ns health checks startar direkt vid registrering
+      (servern visas som initial/unhealthy tills sajten svarar), men en ny server får denna tid på sig innan gruppen
+      river och ersätter den. Täcker installationen via user data. Skiljer sig från InstanceWarmup, som styr när
+      serverns CPU räknas in i skalningen.
+  InstanceWarmup:
+    Type: Number
+    Default: 600
+    Description: >-
+      Sekunder innan en ny servers CPU räknas in i genomsnittet (target tracking). Ska täcka installationen via user data,
+      annars ser policyn den höga CPU:n under installationen som last och kan skala ut i onödan.
+  DeregistrationDelay:
+    Type: Number
+    Default: 30
+    Description: Sekunder en server får "dränera" pågående anrop innan den tas bort ur target groupen.
+  WpTitle:
+    Type: String
+    Default: Novatrix AB
+    AllowedPattern: '^[A-Za-z0-9 ]{1,40}$'
+  WpAdminUser:
+    Type: String
+    Default: novatrix_admin
+    AllowedPattern: '^[a-z][a-z0-9_]{2,30}$'
+  WpAdminEmail:
+    Type: String
+    Default: admin@novatrix.example
+  EnableNightSchedule:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Schemalagd skalning: färre servrar på natten. Spar instanstimmar men ger bara en server (en zon) på natten.
+      Stäng av när du kör failover-testet.
+  NightCron:
+    Type: String
+    Default: '0 20 * * *'
+    Description: När gruppen går ner till nattstorlek (cron, i tidszonen nedan).
+  MorningCron:
+    Type: String
+    Default: '0 7 * * *'
+    Description: När gruppen går tillbaka till normal storlek (varje dag, så att helgen inte blir kvar på natt-läge).
+  ScheduleTimeZone:
+    Type: String
+    Default: Europe/Stockholm
+  NightMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 0
+  NightDesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+
+Conditions:
+  UseNightSchedule: !Equals [!Ref EnableNightSchedule, 'true']
+
+Resources:
+  # ---------------- Lastbalanserare ----------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Prefix}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-PublicSubnetId'
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-PublicSubnetBId'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-AlbSgId'
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-alb'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Prefix}-web-tg'
+      VpcId:
+        Fn::ImportValue: !Sub '${Prefix}-natverk-VpcId'
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      # Health check mot /wp-login.php verifierar hela kedjan (Apache -> PHP -> databas), inte bara att Apache lever.
+      # Kostnaden är lite last: varje lastbalanserarnod kontrollerar varje server, så med 2 noder, 2 servrar och 15 s
+      # intervall blir det ungefär 16 anrop per minut. En statisk fil hade varit billigare men missat databasfel.
+      HealthCheckPath: /wp-login.php
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: !Ref DeregistrationDelay
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-web-tg'
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------- Launch template (ritningen för varje ny server) ----------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${Prefix}-web-lt'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn:
+            Fn::ImportValue: !Sub '${Prefix}-webb-InstanceProfileArn'
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${Prefix}-natverk-WebSgId'
+        Monitoring:
+          Enabled: true                      # detaljerad övervakning: mätvärden varje minut
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 8
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${Prefix}-web'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${Prefix}-web'
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -eEuo pipefail
+              export AWS_DEFAULT_REGION=${AWS::Region}
+              WP_DIR=/var/www/html
+              WP_CONTENT=$WP_DIR/wp-content
+              SITE_URL=http://${AlbDns}
+
+              # ---- Signalering till CloudFormation (fel => rullande uppdatering/skapande rullas tillbaka) ----
+              dnf install -y aws-cfn-bootstrap
+              signal() { /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region} || true; }
+              trap 'rc=$?; if [ $rc -ne 0 ]; then signal 1; fi' EXIT
+
+              dnf install -y httpd php php-fpm php-mysqlnd php-gd php-xml php-mbstring \
+                php-intl php-opcache php-cli php-zip mariadb105 amazon-efs-utils jq cronie
+
+              # ---- Hemligheter (retry: IAM kan ta några sekunder) ----
+              get_secret() {
+                local v=""
+                for i in 1 2 3 4 5 6; do
+                  v=$(aws secretsmanager get-secret-value --secret-id "$1" --query SecretString --output text) && break
+                  sleep 10
+                done
+                [ -n "$v" ] || { echo "FEL: kunde inte läsa hemlighet $1" >&2; exit 1; }
+                echo "$v"
+              }
+              DB_JSON=$(get_secret ${DbSecretArn})
+              DB_USER=$(echo "$DB_JSON" | jq -r .username)
+              DB_PASSWORD=$(echo "$DB_JSON" | jq -r .password)
+              if [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" = "null" ]; then
+                echo "FEL: kunde inte läsa databasuppgifterna" >&2; exit 1
+              fi
+              WP_ADMIN_PASSWORD=$(get_secret ${WpAdminSecretArn})
+              SALT_SEED=$(get_secret ${WpSaltSecretArn})
+
+              # ---- EFS på wp-content (TLS) ----
+              mkdir -p $WP_CONTENT
+              grep -q ${EfsId} /etc/fstab || echo "${EfsId}:/ $WP_CONTENT efs _netdev,noresvport,tls 0 0" >> /etc/fstab
+              for i in 1 2 3 4 5 6; do
+                timeout 90 mount -t efs -o tls ${EfsId}:/ $WP_CONTENT && break
+                sleep 15
+              done
+              mountpoint -q $WP_CONTENT
+
+              # ---- Databasen ----
+              for i in 1 2 3 4 5 6; do
+                MYSQL_PWD="$DB_PASSWORD" mysql --ssl -h ${DbEndpoint} -u "$DB_USER" ${DbName} -e 'SELECT 1' >/dev/null 2>&1 && break
+                sleep 10
+              done
+              MYSQL_PWD="$DB_PASSWORD" mysql --ssl -h ${DbEndpoint} -u "$DB_USER" ${DbName} -e 'SELECT 1' >/dev/null
+
+              curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+              chmod +x /usr/local/bin/wp
+              WP="/usr/local/bin/wp --allow-root --path=$WP_DIR"
+
+              # ---- WordPress: en server i taget (lås på EFS), så att flera servrar som startar samtidigt inte krockar ----
+              exec 9>"$WP_CONTENT/.novatrix-init.lock"
+              flock -w 1200 9
+
+              # Alla servrar installerar exakt samma WordPress-version (den första servern bestämmer och sparar på EFS)
+              VERSION_FILE=$WP_CONTENT/.novatrix-wp-version
+              if [ -f "$VERSION_FILE" ]; then
+                WP_TARBALL=https://wordpress.org/wordpress-$(cat "$VERSION_FILE").tar.gz
+              else
+                WP_TARBALL=https://wordpress.org/latest.tar.gz
+              fi
+              cd /tmp
+              rm -rf /tmp/wordpress /tmp/wordpress.tar.gz
+              curl -fsSL -o wordpress.tar.gz "$WP_TARBALL"
+              tar -xzf wordpress.tar.gz
+              for f in /tmp/wordpress/*; do
+                [ "$(basename "$f")" = "wp-content" ] || cp -a "$f" $WP_DIR/
+              done
+              if [ ! -f "$VERSION_FILE" ]; then
+                # Första gången: fyll EFS med standardteman och plugins, och spara versionen
+                cp -a /tmp/wordpress/wp-content/. $WP_CONTENT/
+                chown -R apache:apache $WP_CONTENT
+                grep -oP "wp_version = '\K[^']+" $WP_DIR/wp-includes/version.php > "$VERSION_FILE"
+              fi
+              rm -rf /tmp/wordpress /tmp/wordpress.tar.gz
+
+              # wp-config.php: samma innehåll på alla servrar (databas, salts och adress)
+              $WP config create --force --dbname=${DbName} --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" \
+                --dbhost=${DbEndpoint} --dbcharset=utf8mb4 --skip-check
+              for k in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+                $WP config set "$k" "$(printf '%s:%s' "$SALT_SEED" "$k" | sha512sum | cut -d' ' -f1)" --type=constant
+              done
+              $WP config set WP_HOME "$SITE_URL" --type=constant
+              $WP config set WP_SITEURL "$SITE_URL" --type=constant
+              $WP config set DISALLOW_FILE_EDIT true --raw --type=constant
+              $WP config set MYSQL_CLIENT_FLAGS MYSQLI_CLIENT_SSL --raw --type=constant
+
+              # Installera sajten bara om den inte redan är installerad (första servern)
+              if ! $WP core is-installed 2>/dev/null; then
+                $WP core install --url="$SITE_URL" --title="${WpTitle}" \
+                  --admin_user="${WpAdminUser}" --admin_password="$WP_ADMIN_PASSWORD" \
+                  --admin_email="${WpAdminEmail}" --skip-email
+              fi
+              flock -u 9
+
+              # ---- Apache och rättigheter ----
+              cat > /etc/httpd/conf.d/novatrix.conf <<'CONF'
+              ServerTokens Prod
+              ServerSignature Off
+              <Directory /var/www/html>
+                  Options -Indexes +FollowSymLinks
+                  AllowOverride All
+              </Directory>
+              CONF
+
+              find $WP_DIR -mindepth 1 -maxdepth 1 ! -name wp-content -exec chown -R apache:apache {} +
+              find $WP_DIR -path "$WP_CONTENT" -prune -o -type d -exec chmod 755 {} +
+              find $WP_DIR -path "$WP_CONTENT" -prune -o -type f -exec chmod 644 {} +
+              chown root:apache $WP_DIR/wp-config.php
+              chmod 640 $WP_DIR/wp-config.php
+
+              # ---- Databasbackup till S3: en per dygn, oavsett hur många servrar som körs ----
+              cat > /usr/local/bin/novatrix-backup.sh <<'BKP'
+              #!/bin/bash
+              set -euo pipefail
+              export AWS_DEFAULT_REGION=${AWS::Region}
+              WP_CONTENT=/var/www/html/wp-content
+              exec 8>"$WP_CONTENT/.novatrix-backup.lock"
+              flock -n 8 || exit 0
+              MARK="$WP_CONTENT/.novatrix-backup-$(date +%Y%m%d)"
+              [ -f "$MARK" ] && exit 0
+              DB_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecretArn} --query SecretString --output text)
+              DB_USER=$(echo "$DB_JSON" | jq -r .username)
+              DB_PASSWORD=$(echo "$DB_JSON" | jq -r .password)
+              TS=$(date +%Y%m%d-%H%M%S)
+              FILE=/tmp/${DbName}-$TS.sql.gz
+              trap 'rm -f "$FILE"' EXIT
+              MYSQL_PWD="$DB_PASSWORD" mysqldump --ssl --host=${DbEndpoint} --user="$DB_USER" \
+                --single-transaction --quick --no-tablespaces ${DbName} | gzip -9 > "$FILE"
+              aws s3 cp "$FILE" "s3://${BackupBucket}/backup/${DbName}-$TS.sql.gz" --only-show-errors
+              touch "$MARK"
+              find "$WP_CONTENT" -maxdepth 1 -name '.novatrix-backup-*' -mtime +30 -delete
+              BKP
+              chmod 750 /usr/local/bin/novatrix-backup.sh
+              echo '0 2 * * * root /usr/local/bin/novatrix-backup.sh >> /var/log/novatrix-backup.log 2>&1' > /etc/cron.d/novatrix-backup
+
+              systemctl enable --now php-fpm httpd crond
+              /usr/local/bin/novatrix-backup.sh || true
+
+              # ---- Signalera klart först när sajten svarar 200 lokalt ----
+              code=000
+              for i in $(seq 1 30); do
+                code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/wp-login.php || true)
+                [ "$code" = "200" ] && break
+                sleep 5
+              done
+              [ "$code" = "200" ]
+
+              trap - EXIT
+              signal 0
+            - EfsId:
+                Fn::ImportValue: !Sub '${Prefix}-data-EfsId'
+              DbEndpoint:
+                Fn::ImportValue: !Sub '${Prefix}-data-DbEndpoint'
+              DbName:
+                Fn::ImportValue: !Sub '${Prefix}-data-DbName'
+              DbSecretArn:
+                Fn::ImportValue: !Sub '${Prefix}-data-DbSecretArn'
+              WpAdminSecretArn:
+                Fn::ImportValue: !Sub '${Prefix}-webb-WpAdminSecretArn'
+              WpSaltSecretArn:
+                Fn::ImportValue: !Sub '${Prefix}-webb-WpSaltSecretArn'
+              AlbDns: !GetAtt LoadBalancer.DNSName
+
+  # ---------------- Auto Scaling-gruppen ----------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Listener                      # target groupen måste vara kopplad till en lastbalanserare först
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT25M
+    UpdatePolicy:                            # ny launch template-version rullas ut en server i taget, utan avbrott
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M                    # max väntetid på signal per server; uppdateringen går vidare direkt när servern signalerar klart
+        WaitOnResourceSignals: true
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+    Properties:
+      AutoScalingGroupName: !Sub '${Prefix}-web-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:                     # ett publikt subnät per zon
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-PublicSubnetId'
+        - Fn::ImportValue: !Sub '${Prefix}-natverk-PublicSubnetBId'
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB                   # en server som inte svarar byts ut, även om instansen "lever"
+      HealthCheckGracePeriod: !Ref HealthCheckGracePeriod
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-web'
+          PropagateAtLaunch: true
+
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: !Ref InstanceWarmup
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref TargetCpuUtilization
+
+  # ---------------- Valfritt: schemalagd skalning (färre servrar på natten) ----------------
+  # Target tracking skalar aldrig under MinSize, så med min 2 körs två servrar dygnet runt.
+  # Schemat sänker min och desired på kvällen och återställer dem på morgonen. Max behålls så att gruppen
+  # fortfarande kan skala ut om lasten ökar på natten.
+  NightScheduledAction:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: UseNightSchedule
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Recurrence: !Ref NightCron
+      TimeZone: !Ref ScheduleTimeZone
+      MinSize: !Ref NightMinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref NightDesiredCapacity
+
+  MorningScheduledAction:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: UseNightSchedule
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Recurrence: !Ref MorningCron
+      TimeZone: !Ref ScheduleTimeZone
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+
+Outputs:
+  SiteUrl:
+    Description: Sajtens adress (lastbalanserarens DNS-namn)
+    Value: !Sub 'http://${LoadBalancer.DNSName}/'
+  AdminUrl:
+    Value: !Sub 'http://${LoadBalancer.DNSName}/wp-admin'
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  WpAdminUser:
+    Value: !Ref WpAdminUser

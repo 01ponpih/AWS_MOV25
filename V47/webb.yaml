@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Novatrix v47 - Webbstack: IAM-roll, instance profile och hemligheter.
+  Själva servrarna startas av Auto Scaling-gruppen i novatrix-skala (webbservern från v46 är borttagen).
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: novatrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  DataBucket:
+    Type: String
+    Description: Befintlig data-bucket som servrarna får läsa.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+  BackupBucket:
+    Type: String
+    Description: Befintlig backup-bucket som servrarna får skriva till under backup/.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+
+Resources:
+  WpAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'WordPress admin password for ${Prefix}'
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-wp-admin-secret'
+
+  # Frö som alla servrar härleder samma WordPress-salts från (så att inloggningen fungerar oavsett vilken server man träffar)
+  WpSaltSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'Seed for WordPress salts, shared by all ${Prefix} web servers'
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-wp-salt-secret'
+
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: s3-data-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: s3:ListBucket, Resource: !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}' }
+              - { Effect: Allow, Action: s3:GetObject, Resource: !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/*' }
+        - PolicyName: s3-backup-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: [s3:PutObject, s3:AbortMultipartUpload], Resource: !Sub 'arn:${AWS::Partition}:s3:::${BackupBucket}/backup/*' }
+        - PolicyName: read-own-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - Fn::ImportValue: !Sub '${Prefix}-data-DbSecretArn'
+                  - !Ref WpAdminSecret
+                  - !Ref WpSaltSecret
+      Tags:
+        - Key: Name
+          Value: !Sub '${Prefix}-web-role'
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WebRole]
+
+Outputs:
+  InstanceProfileArn:
+    Value: !GetAtt WebInstanceProfile.Arn
+    Export: { Name: !Sub '${Prefix}-webb-InstanceProfileArn' }
+  WpAdminSecretArn:
+    Description: Hämta lösenordet med aws secretsmanager get-secret-value
+    Value: !Ref WpAdminSecret
+    Export: { Name: !Sub '${Prefix}-webb-WpAdminSecretArn' }
+  WpSaltSecretArn:
+    Value: !Ref WpSaltSecret
+    Export: { Name: !Sub '${Prefix}-webb-WpSaltSecretArn' }

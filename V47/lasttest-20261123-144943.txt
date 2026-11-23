@@ -1,0 +1,43 @@
+[14:49:45] Start: läge http, 900 s (grupp: novatrix-web-asg, sajt: http://novatrix-alb-316472916.eu-north-1.elb.amazonaws.com)
+[14:49:45] Före lasten (min, desired, max):
+2	2	4
+[14:49:48] CPU(medel)=1%  desired=2  inService=2  healthy=2
+[14:50:20] CPU(medel)=1%  desired=2  inService=2  healthy=2
+[14:50:52] CPU(medel)=1%  desired=2  inService=2  healthy=2
+[14:51:24] CPU(medel)=66%  desired=2  inService=2  healthy=2
+[14:51:56] CPU(medel)=66%  desired=2  inService=2  healthy=2
+[14:52:28] CPU(medel)=76%  desired=2  inService=2  healthy=2
+[14:53:00] CPU(medel)=76%  desired=2  inService=2  healthy=2
+[14:53:32] CPU(medel)=76%  desired=3  inService=3  healthy=2
+[14:54:04] CPU(medel)=75%  desired=3  inService=3  healthy=2
+[14:54:36] CPU(medel)=75%  desired=3  inService=3  healthy=2
+[14:55:08] CPU(medel)=75%  desired=3  inService=3  healthy=3
+[14:55:40] CPU(medel)=75%  desired=3  inService=3  healthy=3
+[14:56:12] CPU(medel)=62%  desired=3  inService=3  healthy=3
+[14:56:44] CPU(medel)=62%  desired=3  inService=3  healthy=3
+[14:57:16] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[14:57:48] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[14:58:20] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[14:58:52] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[14:59:24] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[14:59:56] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[15:00:29] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[15:01:01] CPU(medel)=55%  desired=3  inService=3  healthy=3
+[15:01:33] CPU(medel)=55%  desired=3  inService=3  healthy=3
+[15:02:05] CPU(medel)=55%  desired=3  inService=3  healthy=3
+[15:02:37] CPU(medel)=55%  desired=3  inService=3  healthy=3
+[15:03:09] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[15:03:41] CPU(medel)=56%  desired=3  inService=3  healthy=3
+[15:04:13] CPU(medel)=57%  desired=4  inService=3  healthy=3
+[15:04:45] CPU(medel)=57%  desired=4  inService=4  healthy=3
+[15:05:15] Klart. Senaste skalningshändelser:
+-----------------------------------------------------------------------------------------------------------------------
+|                                              DescribeScalingActivities                                              |
++-----------------------------------+---------------------------+-----------------------------------------------------+
+|  2026-11-23T14:04:07.043000+00:00 |  WaitingForInstanceWarmup |  Launching a new EC2 instance: i-0fa9b84171b7bc97c  |
+|  2026-11-23T13:53:13.411000+00:00 |  Successful               |  Launching a new EC2 instance: i-09eb39d7a87abbf0b  |
+|  2026-11-23T13:30:17.788000+00:00 |  Successful               |  Launching a new EC2 instance: i-0dda8a757afc9c08a  |
+|  2026-11-23T13:30:17.696000+00:00 |  Successful               |  Launching a new EC2 instance: i-07b150178bde84c2c  |
++-----------------------------------+---------------------------+-----------------------------------------------------+
+[15:05:16] Lasten är slut. Gruppen skalar in efter ca 15-20 min (larmet AlarmLow kräver lång tid under målet).
+[15:05:16] Utskriften är sparad i lasttest-20261123-144943.txt
